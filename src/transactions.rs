@@ -654,18 +654,28 @@ impl TableNamespace<'_> {
         transaction: &'txn WriteTransaction,
         definition: TableDefinition<K, V>,
     ) -> Result<Table<'txn, K, V>, TableError> {
+        self.open_table_with_compression(transaction, definition, crate::CompressionAlgorithm::None)
+    }
+
+    pub fn open_table_with_compression<'txn, K: Key + 'static, V: Value + 'static>(
+        &mut self,
+        transaction: &'txn WriteTransaction,
+        definition: TableDefinition<K, V>,
+        compression: crate::CompressionAlgorithm,
+    ) -> Result<Table<'txn, K, V>, TableError> {
         #[cfg(feature = "logging")]
         debug!("Opening table: {definition}");
         let (root, _) = self.inner_open::<K, V>(definition.name(), TableType::Normal)?;
         self.set_dirty(transaction);
 
-        Ok(Table::new(
+        Ok(Table::new_with_compression(
             definition.name(),
             root,
             self.freed_pages.clone(),
             self.allocated_pages.clone(),
             transaction.mem.clone(),
             transaction,
+            compression,
         ))
     }
 
@@ -1266,6 +1276,28 @@ impl WriteTransaction {
         definition: TableDefinition<K, V>,
     ) -> Result<Table<'txn, K, V>, TableError> {
         self.tables.lock().unwrap().open_table(self, definition)
+    }
+
+    /// Open the given table with value compression enabled.
+    ///
+    /// Large values (those that exceed one base page in size) will be compressed using the
+    /// specified algorithm before writing. The compression algorithm is self-describing in the
+    /// on-disk leaf page header, so reads always work correctly regardless of which algorithm
+    /// was used when writing.
+    ///
+    /// The table will be created if it does not exist.
+    ///
+    /// Requires the `compression` Cargo feature.
+    #[track_caller]
+    pub fn open_table_with_compression<'txn, K: Key + 'static, V: Value + 'static>(
+        &'txn self,
+        definition: TableDefinition<K, V>,
+        compression: crate::CompressionAlgorithm,
+    ) -> Result<Table<'txn, K, V>, TableError> {
+        self.tables
+            .lock()
+            .unwrap()
+            .open_table_with_compression(self, definition, compression)
     }
 
     /// Open the given table

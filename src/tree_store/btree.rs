@@ -1,3 +1,4 @@
+use crate::compression::CompressionAlgorithm;
 use crate::db::TransactionGuard;
 use crate::tree_store::btree_base::{
     AccessGuardMut, BRANCH, BranchAccessor, BranchMutator, BtreeHeader, Checksum, DEFERRED, LEAF,
@@ -324,6 +325,7 @@ pub(crate) struct BtreeMut<'a, K: Key + 'static, V: Value + 'static> {
     root: Option<BtreeHeader>,
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
     allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
+    compression: CompressionAlgorithm,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
     _lifetime: PhantomData<&'a ()>,
@@ -343,10 +345,16 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
             root,
             freed_pages,
             allocated_pages,
+            compression: CompressionAlgorithm::None,
             _key_type: Default::default(),
             _value_type: Default::default(),
             _lifetime: Default::default(),
         }
+    }
+
+    pub(crate) fn with_compression(mut self, compression: CompressionAlgorithm) -> Self {
+        self.compression = compression;
+        self
     }
 
     pub(crate) fn finalize_dirty_checksums(&mut self) -> Result<Option<BtreeHeader>> {
@@ -427,7 +435,8 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
             self.mem.clone(),
             freed_pages.as_mut(),
             self.allocated_pages.clone(),
-        );
+        )
+        .with_compression(self.compression);
         let (old_value, _) = operation.insert(key, value)?;
         Ok(old_value)
     }
@@ -801,6 +810,7 @@ pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
     cached_root: Option<PageImpl>,
     root: Option<BtreeHeader>,
     hint: PageHint,
+    compression: CompressionAlgorithm,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
@@ -823,9 +833,15 @@ impl<K: Key, V: Value> Btree<K, V> {
             cached_root,
             root,
             hint,
+            compression: CompressionAlgorithm::None,
             _key_type: Default::default(),
             _value_type: Default::default(),
         })
+    }
+
+    pub(crate) fn with_compression(mut self, compression: CompressionAlgorithm) -> Self {
+        self.compression = compression;
+        self
     }
 
     pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
@@ -875,7 +891,13 @@ impl<K: Key, V: Value> Btree<K, V> {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                 if let Some(entry_index) = accessor.find_key::<K>(query) {
                     let (start, end) = accessor.value_range(entry_index).unwrap();
-                    let guard = AccessGuard::with_page(page, start..end);
+                    let algo = accessor.compression_algorithm();
+                    let guard = if algo.is_active() {
+                        let decompressed = algo.decompress(&page.memory()[start..end]);
+                        AccessGuard::with_owned_value(decompressed)
+                    } else {
+                        AccessGuard::with_page(page, start..end)
+                    };
                     Ok(Some(guard))
                 } else {
                     Ok(None)
@@ -909,8 +931,14 @@ impl<K: Key, V: Value> Btree<K, V> {
             LEAF => {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                 let (key_range, value_range) = accessor.entry_ranges(0).unwrap();
+                let algo = accessor.compression_algorithm();
                 let key_guard = AccessGuard::with_page(page.clone(), key_range);
-                let value_guard = AccessGuard::with_page(page, value_range);
+                let value_guard = if algo.is_active() {
+                    let decompressed = algo.decompress(&page.memory()[value_range]);
+                    AccessGuard::with_owned_value(decompressed)
+                } else {
+                    AccessGuard::with_page(page, value_range)
+                };
                 Ok(Some((key_guard, value_guard)))
             }
             BRANCH => {
@@ -942,8 +970,14 @@ impl<K: Key, V: Value> Btree<K, V> {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                 let (key_range, value_range) =
                     accessor.entry_ranges(accessor.num_pairs() - 1).unwrap();
+                let algo = accessor.compression_algorithm();
                 let key_guard = AccessGuard::with_page(page.clone(), key_range);
-                let value_guard = AccessGuard::with_page(page, value_range);
+                let value_guard = if algo.is_active() {
+                    let decompressed = algo.decompress(&page.memory()[value_range]);
+                    AccessGuard::with_owned_value(decompressed)
+                } else {
+                    AccessGuard::with_page(page, value_range)
+                };
                 Ok(Some((key_guard, value_guard)))
             }
             BRANCH => {

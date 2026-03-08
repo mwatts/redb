@@ -1,3 +1,4 @@
+use crate::compression::CompressionAlgorithm;
 use crate::tree_store::btree_base::{
     BRANCH, BranchAccessor, BranchBuilder, BranchMutator, Checksum, DEFERRED, LEAF, LeafAccessor,
     LeafBuilder, LeafMutator,
@@ -53,6 +54,7 @@ pub(crate) struct MutateHelper<'a, 'b, K: Key, V: Value> {
     mem: Arc<TransactionalMemory>,
     freed: &'b mut Vec<PageNumber>,
     allocated: Arc<Mutex<PageTrackerPolicy>>,
+    compression: CompressionAlgorithm,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
     _lifetime: PhantomData<&'a ()>,
@@ -71,10 +73,16 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
             mem,
             freed,
             allocated,
+            compression: CompressionAlgorithm::None,
             _key_type: Default::default(),
             _value_type: Default::default(),
             _lifetime: Default::default(),
         }
+    }
+
+    pub(crate) fn with_compression(mut self, compression: CompressionAlgorithm) -> Self {
+        self.compression = compression;
+        self
     }
 
     // Creates a new mutator which will not modify any existing uncommitted pages, or free any existing pages.
@@ -91,6 +99,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
             mem,
             freed,
             allocated,
+            compression: CompressionAlgorithm::None,
             _key_type: Default::default(),
             _value_type: Default::default(),
             _lifetime: Default::default(),
@@ -201,7 +210,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 1,
                 K::fixed_width(),
                 V::fixed_width(),
-            );
+            )
+            .with_compression(self.compression);
             builder.push(key_bytes, value_bytes);
             let page = builder.build()?;
 
@@ -229,9 +239,13 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                 let (position, found) = accessor.position::<K>(key);
 
-                // Fast-path to avoid re-building and splitting pages with a single large value
+                // Fast-path to avoid re-building and splitting pages with a single large value.
+                // Also applies to compressed single-value pages: their total_length() reflects
+                // the compressed size and may be smaller than page_size, but logically they are
+                // still single-value pages that must not share a leaf with a second entry.
                 let single_large_value = accessor.num_pairs() == 1
-                    && accessor.total_length() >= self.mem.get_page_size();
+                    && (accessor.total_length() >= self.mem.get_page_size()
+                        || accessor.compression_algorithm().is_active());
                 if !found && single_large_value {
                     let mut builder = LeafBuilder::new(
                         &self.mem,
@@ -239,7 +253,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                         1,
                         K::fixed_width(),
                         V::fixed_width(),
-                    );
+                    )
+                    .with_compression(self.compression);
                     builder.push(key, value);
                     let new_page = builder.build()?;
                     let new_page_number = new_page.get_page_number();
@@ -286,8 +301,10 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 {
                     let page_number = page.get_page_number();
                     let existing_value = if found {
-                        let copied_value = accessor.entry(position).unwrap().value().to_vec();
-                        Some(AccessGuard::with_owned_value(copied_value))
+                        let raw = accessor.entry(position).unwrap().value().to_vec();
+                        let algo = accessor.compression_algorithm();
+                        let bytes = if algo.is_active() { algo.decompress(&raw) } else { raw };
+                        Some(AccessGuard::with_owned_value(bytes))
                     } else {
                         None
                     };
@@ -315,7 +332,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     accessor.num_pairs() + 1,
                     K::fixed_width(),
                     V::fixed_width(),
-                );
+                )
+                .with_compression(self.compression);
                 for i in 0..accessor.num_pairs() {
                     if i == position {
                         builder.push(key, value);
@@ -334,7 +352,20 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     let page_number = page.get_page_number();
                     let existing_value = if found {
                         let (start, end) = accessor.value_range(position).unwrap();
-                        if self.modify_uncommitted && self.mem.uncommitted(page_number) {
+                        let algo = accessor.compression_algorithm();
+                        if algo.is_active() {
+                            // Decompress the old value before the page is freed/dropped.
+                            let decompressed = algo.decompress(&page.memory()[start..end]);
+                            if self.modify_uncommitted && self.mem.uncommitted(page_number) {
+                                drop(page);
+                                let mut allocated = self.allocated.lock().unwrap();
+                                self.mem.free(page_number, &mut allocated);
+                            } else {
+                                drop(page);
+                                self.freed.push(page_number);
+                            }
+                            Some(AccessGuard::with_owned_value(decompressed))
+                        } else if self.modify_uncommitted && self.mem.uncommitted(page_number) {
                             let arc = page.to_arc();
                             drop(page);
                             let mut allocated = self.allocated.lock().unwrap();
@@ -637,7 +668,21 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
             Subtree(new_page.get_page_number(), DEFERRED)
         };
         let (start, end) = accessor.value_range(position).unwrap();
-        let guard = if uncommitted && self.modify_uncommitted {
+        let algo = accessor.compression_algorithm();
+        let guard = if algo.is_active() {
+            // Decompress the value before freeing the page.
+            let decompressed = algo.decompress(&page.memory()[start..end]);
+            if uncommitted && self.modify_uncommitted {
+                let page_number = page.get_page_number();
+                drop(page);
+                let mut allocated = self.allocated.lock().unwrap();
+                self.mem.free(page_number, &mut allocated);
+            } else {
+                self.freed.push(page.get_page_number());
+                drop(page);
+            }
+            Some(AccessGuard::with_owned_value(decompressed))
+        } else if uncommitted && self.modify_uncommitted {
             let page_number = page.get_page_number();
             let arc = page.to_arc();
             drop(page);
