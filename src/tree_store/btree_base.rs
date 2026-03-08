@@ -1,3 +1,4 @@
+use crate::compression::CompressionAlgorithm;
 use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory, xxh3_checksum};
 use crate::tree_store::{PageNumber, PageTrackerPolicy};
 use crate::types::{Key, MutInPlaceValue, Value};
@@ -619,6 +620,12 @@ impl<'a> LeafAccessor<'a> {
     pub(super) fn last_entry(&self) -> EntryAccessor<'a> {
         self.entry(self.num_pairs() - 1).unwrap()
     }
+
+    /// Returns the compression algorithm indicated by byte[1] of the leaf page header.
+    /// Returns `CompressionAlgorithm::None` for uncompressed pages (byte[1] == 0).
+    pub(crate) fn compression_algorithm(&self) -> CompressionAlgorithm {
+        CompressionAlgorithm::from_flag_byte(self.page[1])
+    }
 }
 
 pub(super) struct LeafBuilder<'a, 'b> {
@@ -629,6 +636,7 @@ pub(super) struct LeafBuilder<'a, 'b> {
     total_value_bytes: usize,
     mem: &'b TransactionalMemory,
     allocated_pages: &'b Mutex<PageTrackerPolicy>,
+    compression: CompressionAlgorithm,
 }
 
 impl<'a, 'b> LeafBuilder<'a, 'b> {
@@ -656,7 +664,15 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             total_value_bytes: 0,
             mem,
             allocated_pages,
+            compression: CompressionAlgorithm::None,
         }
+    }
+
+    /// Enable value compression for this leaf. Only takes effect in `build()` for
+    /// single-pair pages whose value exceeds one base page in size.
+    pub(super) fn with_compression(mut self, compression: CompressionAlgorithm) -> Self {
+        self.compression = compression;
+        self
     }
 
     pub(super) fn push(&mut self, key: &'a [u8], value: &'a [u8]) {
@@ -742,6 +758,59 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
     }
 
     pub(super) fn build(self) -> Result<PageMut> {
+        // Attempt compression for single-value pages that overflow one base page.
+        //
+        // Conditions:
+        //   - Exactly one key-value pair (multi-pair pages share a page with others; compressing
+        //     them would leave unpredictable gaps and break B-tree fill heuristics).
+        //   - Variable-size value (fixed-width types cannot change allocation order).
+        //   - A compressing algorithm has been configured.
+        //   - The uncompressed data requires more than one base page (i.e. page_order > 0).
+        if self.pairs.len() == 1
+            && self.fixed_value_size.is_none()
+            && self.compression.is_active()
+        {
+            let (key, value) = self.pairs[0];
+            let page_size = self.mem.get_page_size();
+            let uncompressed_required =
+                self.required_bytes(1, key.len() + value.len());
+
+            if uncompressed_required > page_size {
+                // Value is large enough to occupy a higher-order allocation; try compression.
+                if let Some(compressed) = self.compression.compress(value) {
+                    let compressed_required =
+                        self.required_bytes(1, key.len() + compressed.len());
+
+                    // Only switch to compressed storage when we save at least one buddy order
+                    // (i.e. the compressed page is strictly smaller on disk).
+                    if compressed_required < uncompressed_required {
+                        let mut allocated_pages = self.allocated_pages.lock().unwrap();
+                        let mut page =
+                            self.mem.allocate(compressed_required, &mut allocated_pages)?;
+                        {
+                            let mem = page.memory_mut();
+                            // Write compressed value via RawLeafBuilder. We pass None for
+                            // fixed_value_size because the compressed length varies.
+                            let mut builder = RawLeafBuilder::new(
+                                mem,
+                                1,
+                                self.fixed_key_size,
+                                None,
+                                key.len(),
+                            );
+                            builder.append(key, &compressed);
+                            // builder.drop() asserts pairs_written == num_pairs, so we must
+                            // drop it before accessing page memory again.
+                        }
+                        // Stamp the compression algorithm into the reserved header byte.
+                        page.memory_mut()[1] = self.compression.flag_byte();
+                        return Ok(page);
+                    }
+                }
+            }
+        }
+
+        // Standard (uncompressed) path.
         let required_size = self.required_bytes(
             self.pairs.len(),
             self.total_key_bytes + self.total_value_bytes,
