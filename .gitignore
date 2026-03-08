@@ -29,3 +29,4 @@ flamegraph.svg
 
 # Git worktrees
 .worktrees/
+.claude/
