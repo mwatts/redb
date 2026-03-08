@@ -107,6 +107,26 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         page_allocator: PageAllocator,
         transaction: &'txn WriteTransaction,
     ) -> Table<'txn, K, V> {
+        Self::new_with_compression(
+            name,
+            table_root,
+            freed_pages,
+            allocated_pages,
+            mem,
+            transaction,
+            crate::CompressionAlgorithm::None,
+        )
+    }
+
+    pub(crate) fn new_with_compression(
+        name: &str,
+        table_root: Option<BtreeHeader>,
+        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+        allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
+        mem: Arc<TransactionalMemory>,
+        transaction: &'txn WriteTransaction,
+        compression: crate::CompressionAlgorithm,
+    ) -> Table<'txn, K, V> {
         Table {
             name: name.to_string(),
             transaction,
@@ -116,7 +136,8 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
                 page_allocator,
                 freed_pages,
                 allocated_pages,
-            ),
+            )
+            .with_compression(compression),
         }
     }
 
@@ -663,12 +684,7 @@ impl<
 
     fn next(&mut self) -> Option<Self::Item> {
         let entry = self.inner.next()?;
-        Some(entry.map(|entry| {
-            let (page, key_range, value_range) = entry.into_raw();
-            let key = AccessGuard::with_page(page.clone(), key_range);
-            let value = AccessGuard::with_page(page, value_range);
-            (key, value)
-        }))
+        Some(entry.map(|entry| entry.into_guards()))
     }
 }
 
@@ -680,12 +696,7 @@ impl<
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         let entry = self.inner.next_back()?;
-        Some(entry.map(|entry| {
-            let (page, key_range, value_range) = entry.into_raw();
-            let key = AccessGuard::with_page(page.clone(), key_range);
-            let value = AccessGuard::with_page(page, value_range);
-            (key, value)
-        }))
+        Some(entry.map(|entry| entry.into_guards()))
     }
 }
 
@@ -711,27 +722,13 @@ impl<'a, K: Key + 'static, V: Value + 'static> Iterator for Range<'a, K, V> {
     type Item = Result<(AccessGuard<'a, K>, AccessGuard<'a, V>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|x| {
-            x.map(|entry| {
-                let (page, key_range, value_range) = entry.into_raw();
-                let key = AccessGuard::with_page(page.clone(), key_range);
-                let value = AccessGuard::with_page(page, value_range);
-                (key, value)
-            })
-        })
+        self.inner.next().map(|x| x.map(|entry| entry.into_guards()))
     }
 }
 
 impl<K: Key + 'static, V: Value + 'static> DoubleEndedIterator for Range<'_, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|x| {
-            x.map(|entry| {
-                let (page, key_range, value_range) = entry.into_raw();
-                let key = AccessGuard::with_page(page.clone(), key_range);
-                let value = AccessGuard::with_page(page, value_range);
-                (key, value)
-            })
-        })
+        self.inner.next_back().map(|x| x.map(|entry| entry.into_guards()))
     }
 }
 

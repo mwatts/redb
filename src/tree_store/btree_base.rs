@@ -1,3 +1,4 @@
+use crate::compression::CompressionAlgorithm;
 use crate::tree_store::page_store::{Page, PageImpl, PageMut, xxh3_checksum};
 use crate::tree_store::{PageAllocator, PageNumber, PageTrackerPolicy};
 use crate::types::{Key, MutInPlaceValue, Value};
@@ -631,6 +632,12 @@ impl<'a> LeafAccessor<'a> {
     pub(super) fn last_entry(&self) -> EntryAccessor<'a> {
         self.entry(self.num_pairs() - 1).unwrap()
     }
+
+    /// Returns the compression algorithm indicated by byte[1] of the leaf page header.
+    /// Returns `CompressionAlgorithm::None` for uncompressed pages (byte[1] == 0).
+    pub(crate) fn compression_algorithm(&self) -> CompressionAlgorithm {
+        CompressionAlgorithm::from_flag_byte(self.page[1])
+    }
 }
 
 pub(super) struct LeafBuilder<'a, 'b> {
@@ -641,6 +648,7 @@ pub(super) struct LeafBuilder<'a, 'b> {
     total_value_bytes: usize,
     page_allocator: &'b PageAllocator,
     allocated_pages: &'b Mutex<PageTrackerPolicy>,
+    compression: CompressionAlgorithm,
 }
 
 impl<'a, 'b> LeafBuilder<'a, 'b> {
@@ -668,7 +676,15 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             total_value_bytes: 0,
             page_allocator,
             allocated_pages,
+            compression: CompressionAlgorithm::None,
         }
+    }
+
+    /// Enable value compression for this leaf. Only takes effect in `build()` for
+    /// single-pair pages whose value exceeds one base page in size.
+    pub(super) fn with_compression(mut self, compression: CompressionAlgorithm) -> Self {
+        self.compression = compression;
+        self
     }
 
     pub(super) fn push(&mut self, key: &'a [u8], value: &'a [u8]) {
@@ -758,6 +774,41 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
     }
 
     pub(super) fn build<'txn>(self) -> Result<PageMut<'txn>> {
+        if self.pairs.len() == 1
+            && self.fixed_value_size.is_none()
+            && self.compression.is_active()
+        {
+            let (key, value) = self.pairs[0];
+            let uncompressed_required =
+                self.required_bytes(1, key.len() + value.len());
+
+            let page_size = self.page_allocator.get_page_size();
+            if uncompressed_required > page_size {
+                if let Some(compressed) = self.compression.compress(value) {
+                    let compressed_required =
+                        self.required_bytes(1, key.len() + compressed.len());
+
+                    if compressed_required < uncompressed_required {
+                        let mut allocated_pages = self.allocated_pages.lock().unwrap();
+                        let mut page =
+                            self.page_allocator.allocate(compressed_required, &mut allocated_pages)?;
+                        {
+                            let mem = page.memory_mut();
+                            let mut builder = RawLeafBuilder::new(
+                                mem,
+                                1,
+                                self.fixed_key_size,
+                                None,
+                                key.len(),
+                            );
+                            builder.append(key, &compressed);
+                        }
+                        page.memory_mut()[1] = self.compression.flag_byte();
+                        return Ok(page);
+                    }
+                }
+            }
+        }
         let required_size = self.required_bytes(
             self.pairs.len(),
             self.total_key_bytes + self.total_value_bytes,

@@ -1,3 +1,4 @@
+use crate::compression::CompressionAlgorithm;
 use crate::Result;
 use crate::tree_store::btree_base::{BRANCH, BtreeHeader, Checksum, EntryAccessor, LEAF};
 use crate::tree_store::btree_base::{BranchAccessor, LeafAccessor};
@@ -487,16 +488,26 @@ pub(crate) struct EntryGuard<K: Key, V: Value> {
     page: PageImpl,
     key_range: Range<usize>,
     value_range: Range<usize>,
+    /// Pre-decompressed value bytes, present when the leaf page uses compression.
+    decompressed_value: Option<Vec<u8>>,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
 
 impl<K: Key, V: Value> EntryGuard<K, V> {
     fn new(page: PageImpl, key_range: Range<usize>, value_range: Range<usize>) -> Self {
+        // Eagerly decompress when the leaf page carries compressed values.
+        let algo = CompressionAlgorithm::from_flag_byte(page.memory()[1]);
+        let decompressed_value = if algo.is_active() {
+            Some(algo.decompress(&page.memory()[value_range.clone()]))
+        } else {
+            None
+        };
         Self {
             page,
             key_range,
             value_range,
+            decompressed_value,
             _key_type: PhantomData,
             _value_type: PhantomData,
         }
@@ -511,7 +522,23 @@ impl<K: Key, V: Value> EntryGuard<K, V> {
     }
 
     pub(crate) fn value(&self) -> V::SelfType<'_> {
-        V::from_bytes(&self.page.memory()[self.value_range.clone()])
+        if let Some(ref decompressed) = self.decompressed_value {
+            V::from_bytes(decompressed)
+        } else {
+            V::from_bytes(&self.page.memory()[self.value_range.clone()])
+        }
+    }
+
+    /// Decompose this guard into `(AccessGuard<K>, AccessGuard<V>)`, handling compressed
+    /// values transparently. For uncompressed pages this is zero-copy.
+    pub(crate) fn into_guards(self) -> (crate::AccessGuard<'static, K>, crate::AccessGuard<'static, V>) {
+        let key_guard = crate::AccessGuard::with_page(self.page.clone(), self.key_range);
+        let value_guard = if let Some(decompressed) = self.decompressed_value {
+            crate::AccessGuard::with_owned_value(decompressed)
+        } else {
+            crate::AccessGuard::with_page(self.page, self.value_range)
+        };
+        (key_guard, value_guard)
     }
 
     pub(crate) fn into_raw(self) -> (PageImpl, Range<usize>, Range<usize>) {
