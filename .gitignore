@@ -26,3 +26,6 @@ flamegraph.svg
 .vscode/settings.json
 
 **/*.redb
+
+# Git worktrees
+.worktrees/
