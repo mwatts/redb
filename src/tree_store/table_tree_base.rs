@@ -1,3 +1,4 @@
+use crate::compression::CompressionAlgorithm;
 use crate::tree_store::btree::{PagePath, UntypedBtree, UntypedBtreeMut};
 use crate::tree_store::multimap_btree::{UntypedMultiBtree, relocate_subtrees};
 use crate::tree_store::{BtreeHeader, PageAllocator, PageHint, PageNumber, PageResolver};
@@ -56,6 +57,7 @@ pub(crate) enum InternalTableDefinition {
         value_alignment: usize,
         key_type: TypeName,
         value_type: TypeName,
+        compression: CompressionAlgorithm,
     },
     Multimap {
         table_root: Option<BtreeHeader>,
@@ -66,6 +68,7 @@ pub(crate) enum InternalTableDefinition {
         value_alignment: usize,
         key_type: TypeName,
         value_type: TypeName,
+        compression: CompressionAlgorithm,
     },
 }
 
@@ -74,6 +77,7 @@ impl InternalTableDefinition {
         table_type: TableType,
         table_root: Option<BtreeHeader>,
         table_length: u64,
+        compression: CompressionAlgorithm,
     ) -> Self {
         match table_type {
             TableType::Normal => InternalTableDefinition::Normal {
@@ -85,6 +89,7 @@ impl InternalTableDefinition {
                 value_alignment: ALIGNMENT,
                 key_type: K::type_name(),
                 value_type: V::type_name(),
+                compression,
             },
             TableType::Multimap => InternalTableDefinition::Multimap {
                 table_root,
@@ -95,6 +100,7 @@ impl InternalTableDefinition {
                 value_alignment: ALIGNMENT,
                 key_type: K::type_name(),
                 value_type: V::type_name(),
+                compression,
             },
         }
     }
@@ -336,6 +342,22 @@ impl InternalTableDefinition {
             | InternalTableDefinition::Multimap { value_type, .. } => value_type.clone(),
         }
     }
+
+    pub(crate) fn get_compression(&self) -> CompressionAlgorithm {
+        match self {
+            InternalTableDefinition::Normal { compression, .. }
+            | InternalTableDefinition::Multimap { compression, .. } => *compression,
+        }
+    }
+
+    pub(super) fn set_compression(&mut self, algo: CompressionAlgorithm) {
+        match self {
+            InternalTableDefinition::Normal { compression, .. }
+            | InternalTableDefinition::Multimap { compression, .. } => {
+                *compression = algo;
+            }
+        }
+    }
 }
 
 impl Value for InternalTableDefinition {
@@ -417,12 +439,32 @@ impl Value for InternalTableDefinition {
         ) as usize;
         offset += size_of::<u32>();
 
-        let key_type_len = u32::from_le_bytes(
-            data[offset..(offset + size_of::<u32>())]
+        // Try reading the compression byte (new format). In the old format this byte is
+        // the first byte of key_type_len (a u32 LE). We detect old format by checking
+        // whether interpreting the next 4 bytes as key_type_len (after consuming the
+        // compression byte) would produce a value that overruns the data.
+        let (compression, key_type_len);
+        let candidate_compression = data[offset];
+        let candidate_key_type_len = u32::from_le_bytes(
+            data[(offset + 1)..(offset + 1 + size_of::<u32>())]
                 .try_into()
                 .unwrap(),
         ) as usize;
-        offset += size_of::<u32>();
+        if offset + 1 + size_of::<u32>() + candidate_key_type_len <= data.len() {
+            // New format: compression byte is present
+            compression = CompressionAlgorithm::from_flag_byte(candidate_compression);
+            key_type_len = candidate_key_type_len;
+            offset += 1 + size_of::<u32>();
+        } else {
+            // Old format: no compression byte, read key_type_len directly
+            compression = CompressionAlgorithm::None;
+            key_type_len = u32::from_le_bytes(
+                data[offset..(offset + size_of::<u32>())]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            offset += size_of::<u32>();
+        }
         let key_type = TypeName::from_bytes(&data[offset..(offset + key_type_len)]);
         offset += key_type_len;
         let value_type = TypeName::from_bytes(&data[offset..]);
@@ -437,6 +479,7 @@ impl Value for InternalTableDefinition {
                 value_alignment,
                 key_type,
                 value_type,
+                compression,
             },
             TableType::Multimap => InternalTableDefinition::Multimap {
                 table_root,
@@ -447,6 +490,7 @@ impl Value for InternalTableDefinition {
                 value_alignment,
                 key_type,
                 value_type,
+                compression,
             },
         }
     }
@@ -492,6 +536,7 @@ impl Value for InternalTableDefinition {
                 .unwrap()
                 .to_le_bytes(),
         );
+        result.push(value.get_compression().flag_byte());
         let key_type_bytes = value.private_key_type().to_bytes();
         result.extend_from_slice(&u32::try_from(key_type_bytes.len()).unwrap().to_le_bytes());
         result.extend_from_slice(&key_type_bytes);

@@ -112,7 +112,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
             table_root,
             freed_pages,
             allocated_pages,
-            mem,
+            page_allocator,
             transaction,
             crate::CompressionAlgorithm::None,
         )
@@ -123,7 +123,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         table_root: Option<BtreeHeader>,
         freed_pages: Arc<Mutex<Vec<PageNumber>>>,
         allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
-        mem: Arc<TransactionalMemory>,
+        page_allocator: PageAllocator,
         transaction: &'txn WriteTransaction,
         compression: crate::CompressionAlgorithm,
     ) -> Table<'txn, K, V> {

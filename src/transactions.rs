@@ -547,7 +547,7 @@ impl SystemNamespace {
     ) -> Result<SystemTable<'s, K, V>> {
         let (root, _) = self
             .table_tree
-            .get_or_create_table::<K, V>(definition.name(), TableType::Normal)
+            .get_or_create_table::<K, V>(definition.name(), TableType::Normal, crate::CompressionAlgorithm::None)
             .map_err(|e| {
                 e.into_storage_error_or_corrupted("Internal error. System table is corrupted")
             })?;
@@ -642,6 +642,7 @@ impl TableNamespace {
         &mut self,
         name: &str,
         table_type: TableType,
+        compression: crate::CompressionAlgorithm,
     ) -> Result<(Option<BtreeHeader>, u64), TableError> {
         if let Some(location) = self.open_tables.get(name) {
             return Err(TableError::TableAlreadyOpen(name.to_string(), location));
@@ -649,7 +650,7 @@ impl TableNamespace {
 
         let root = self
             .table_tree
-            .get_or_create_table::<K, V>(name, table_type)?;
+            .get_or_create_table::<K, V>(name, table_type, compression)?;
         self.open_tables
             .insert(name.to_string(), panic::Location::caller());
 
@@ -664,7 +665,8 @@ impl TableNamespace {
     ) -> Result<MultimapTable<'txn, K, V>, TableError> {
         #[cfg(feature = "logging")]
         debug!("Opening multimap table: {definition}");
-        let (root, length) = self.inner_open::<K, V>(definition.name(), TableType::Multimap)?;
+        let (root, length) =
+            self.inner_open::<K, V>(definition.name(), TableType::Multimap, crate::CompressionAlgorithm::None)?;
         self.set_dirty(transaction);
 
         Ok(MultimapTable::new(
@@ -695,7 +697,7 @@ impl TableNamespace {
     ) -> Result<Table<'txn, K, V>, TableError> {
         #[cfg(feature = "logging")]
         debug!("Opening table: {definition}");
-        let (root, _) = self.inner_open::<K, V>(definition.name(), TableType::Normal)?;
+        let (root, _) = self.inner_open::<K, V>(definition.name(), TableType::Normal, compression)?;
         self.set_dirty(transaction);
 
         Ok(Table::new_with_compression(

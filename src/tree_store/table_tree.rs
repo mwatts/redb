@@ -1,3 +1,4 @@
+use crate::compression::CompressionAlgorithm;
 use crate::db::TransactionGuard;
 use crate::error::TableError;
 use crate::tree_store::btree::{PagePath, UntypedBtreeMut, btree_stats};
@@ -399,11 +400,20 @@ impl TableTreeMut {
         // free any pages.
         let bytes = self.tree.force_uncommitted(
             &name,
-            &InternalTableDefinition::new::<K, V>(TableType::Normal, None, 0),
+            &InternalTableDefinition::new::<K, V>(
+                TableType::Normal,
+                None,
+                0,
+                CompressionAlgorithm::None,
+            ),
         )?;
 
-        let table_root = match InternalTableDefinition::from_bytes(&bytes) {
-            InternalTableDefinition::Normal { table_root, .. } => table_root,
+        let (table_root, compression) = match InternalTableDefinition::from_bytes(&bytes) {
+            InternalTableDefinition::Normal {
+                table_root,
+                compression,
+                ..
+            } => (table_root, compression),
             InternalTableDefinition::Multimap { .. } => {
                 unreachable!()
             }
@@ -426,7 +436,12 @@ impl TableTreeMut {
         // Flush the root to the table tree, without allocating
         self.tree.insert_inplace(
             &name,
-            &InternalTableDefinition::new::<K, V>(TableType::Normal, table_root, table_length),
+            &InternalTableDefinition::new::<K, V>(
+                TableType::Normal,
+                table_root,
+                table_length,
+                compression,
+            ),
         )?;
 
         Ok(())
@@ -446,7 +461,12 @@ impl TableTreeMut {
         // Reserve space in the table tree
         self.tree.insert(
             &name,
-            &InternalTableDefinition::new::<K, V>(TableType::Normal, None, 0),
+            &InternalTableDefinition::new::<K, V>(
+                TableType::Normal,
+                None,
+                0,
+                CompressionAlgorithm::None,
+            ),
         )?;
 
         // Create an empty table and call the provided closure on it
@@ -466,7 +486,12 @@ impl TableTreeMut {
         // Flush the root to the table tree, without allocating
         self.tree.insert_inplace(
             &name,
-            &InternalTableDefinition::new::<K, V>(TableType::Normal, table_root, table_length),
+            &InternalTableDefinition::new::<K, V>(
+                TableType::Normal,
+                table_root,
+                table_length,
+                CompressionAlgorithm::None,
+            ),
         )?;
 
         Ok(())
@@ -594,11 +619,21 @@ impl TableTreeMut {
         &mut self,
         name: &str,
         table_type: TableType,
+        compression: crate::CompressionAlgorithm,
     ) -> Result<(Option<BtreeHeader>, u64), TableError> {
         let table = if let Some(found) = self.get_table::<K, V>(name, table_type)? {
+            let stored = found.get_compression();
+            if stored != compression {
+                return Err(TableError::CompressionAlgorithmMismatch {
+                    table: name.to_string(),
+                    stored: format!("{stored:?}"),
+                    requested: format!("{compression:?}"),
+                });
+            }
             found
         } else {
-            let table = InternalTableDefinition::new::<K, V>(table_type, None, 0);
+            let table =
+                InternalTableDefinition::new::<K, V>(table_type, None, 0, compression);
             self.tree.insert(&name, &table)?;
             table
         };
@@ -785,6 +820,7 @@ mod test {
             value_alignment: 7,
             key_type: TypeName::new("test::Key"),
             value_type: TypeName::new("test::Value"),
+            compression: CompressionAlgorithm::None,
         };
         let y = InternalTableDefinition::from_bytes(InternalTableDefinition::as_bytes(&x).as_ref());
         assert_eq!(x, y);
