@@ -103,6 +103,12 @@ pub enum TableError {
     // Tables cannot be opened for writing multiple times, since they could retrieve immutable &
     // mutable references to the same dirty pages, or multiple mutable references via insert_reserve()
     TableAlreadyOpen(String, &'static panic::Location<'static>),
+    /// Table was created with a different compression algorithm than the one requested
+    CompressionAlgorithmMismatch {
+        table: String,
+        stored: String,
+        requested: String,
+    },
     /// Error from underlying storage
     Storage(StorageError),
 }
@@ -116,7 +122,8 @@ impl TableError {
             | TableError::TypeDefinitionChanged { .. }
             | TableError::TableDoesNotExist(_)
             | TableError::TableExists(_)
-            | TableError::TableAlreadyOpen(_, _) => {
+            | TableError::TableAlreadyOpen(_, _)
+            | TableError::CompressionAlgorithmMismatch { .. } => {
                 StorageError::Corrupted(format!("{msg}: {self}"))
             }
             TableError::Storage(storage) => storage,
@@ -144,6 +151,15 @@ impl From<TableError> for Error {
             TableError::TableDoesNotExist(table) => Error::TableDoesNotExist(table),
             TableError::TableExists(table) => Error::TableExists(table),
             TableError::TableAlreadyOpen(name, location) => Error::TableAlreadyOpen(name, location),
+            TableError::CompressionAlgorithmMismatch {
+                table,
+                stored,
+                requested,
+            } => Error::CompressionAlgorithmMismatch {
+                table,
+                stored,
+                requested,
+            },
             TableError::Storage(storage) => storage.into(),
         }
     }
@@ -193,6 +209,16 @@ impl Display for TableError {
             }
             TableError::TableAlreadyOpen(name, location) => {
                 write!(f, "Table '{name}' already opened at: {location}")
+            }
+            TableError::CompressionAlgorithmMismatch {
+                table,
+                stored,
+                requested,
+            } => {
+                write!(
+                    f,
+                    "Table '{table}' was created with compression algorithm {stored}, but opened with {requested}"
+                )
             }
             TableError::Storage(storage) => storage.fmt(f),
         }
@@ -529,6 +555,12 @@ pub enum Error {
     // Tables cannot be opened for writing multiple times, since they could retrieve immutable &
     // mutable references to the same dirty pages, or multiple mutable references via insert_reserve()
     TableAlreadyOpen(String, &'static panic::Location<'static>),
+    /// Table was created with a different compression algorithm than the one requested
+    CompressionAlgorithmMismatch {
+        table: String,
+        stored: String,
+        requested: String,
+    },
     Io(io::Error),
     DatabaseClosed,
     /// A previous IO error occurred. The database must be closed and re-opened
@@ -604,6 +636,16 @@ impl Display for Error {
             }
             Error::TableAlreadyOpen(name, location) => {
                 write!(f, "Table '{name}' already opened at: {location}")
+            }
+            Error::CompressionAlgorithmMismatch {
+                table,
+                stored,
+                requested,
+            } => {
+                write!(
+                    f,
+                    "Table '{table}' was created with compression algorithm {stored}, but opened with {requested}"
+                )
             }
             Error::Io(err) => {
                 write!(f, "I/O error: {err}")
