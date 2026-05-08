@@ -350,14 +350,6 @@ impl InternalTableDefinition {
         }
     }
 
-    pub(super) fn set_compression(&mut self, algo: CompressionAlgorithm) {
-        match self {
-            InternalTableDefinition::Normal { compression, .. }
-            | InternalTableDefinition::Multimap { compression, .. } => {
-                *compression = algo;
-            }
-        }
-    }
 }
 
 impl Value for InternalTableDefinition {

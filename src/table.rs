@@ -106,25 +106,6 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
         page_allocator: PageAllocator,
         transaction: &'txn WriteTransaction,
-    ) -> Table<'txn, K, V> {
-        Self::new_with_compression(
-            name,
-            table_root,
-            freed_pages,
-            allocated_pages,
-            page_allocator,
-            transaction,
-            crate::CompressionAlgorithm::None,
-        )
-    }
-
-    pub(crate) fn new_with_compression(
-        name: &str,
-        table_root: Option<BtreeHeader>,
-        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-        allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
-        page_allocator: PageAllocator,
-        transaction: &'txn WriteTransaction,
         compression: crate::CompressionAlgorithm,
     ) -> Table<'txn, K, V> {
         Table {

@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::compression::CompressionAlgorithm;
 use crate::tree_store::btree_base::{
     BRANCH, BranchAccessor, BranchBuilder, Checksum, DEFERRED, LEAF, LeafAccessor, LeafBuilder,
     RawBranchBuilder, RawLeafBuilder,
@@ -87,6 +88,7 @@ pub(super) struct SubtreeRebuildContext<'a, K: Key, V: Value> {
     allocated: &'a Mutex<PageTrackerPolicy>,
     freed: &'a mut Vec<PageNumber>,
     modify_uncommitted: bool,
+    pub(super) compression: CompressionAlgorithm,
     _types: PhantomData<(K, V)>,
 }
 
@@ -96,12 +98,14 @@ impl<'a, K: Key, V: Value> SubtreeRebuildContext<'a, K, V> {
         allocated: &'a Mutex<PageTrackerPolicy>,
         freed: &'a mut Vec<PageNumber>,
         modify_uncommitted: bool,
+        compression: CompressionAlgorithm,
     ) -> Self {
         Self {
             page_allocator,
             allocated,
             freed,
             modify_uncommitted,
+            compression,
             _types: PhantomData,
         }
     }
@@ -250,22 +254,50 @@ impl SealedSubtree {
                     SubtreeEdge::Left => self.upper_key.clone(),
                     SubtreeEdge::Right => Some(entries.back().unwrap().0.clone()),
                 };
+                let source_algo = accessor.compression_algorithm();
+                let decompressed_page_entries: Vec<(Vec<u8>, Vec<u8>)> =
+                    if source_algo.is_active() {
+                        (0..accessor.num_pairs())
+                            .map(|i| {
+                                let entry = accessor.entry(i).unwrap();
+                                (
+                                    entry.key().to_vec(),
+                                    source_algo.decompress(entry.value()),
+                                )
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                 let mut builder = LeafBuilder::new(
                     context.page_allocator,
                     context.allocated,
                     entries.len() + accessor.num_pairs(),
                     K::fixed_width(),
                     V::fixed_width(),
-                );
+                )
+                .with_compression(context.compression);
                 match edge {
                     SubtreeEdge::Left => {
                         for (key, value) in &entries {
                             builder.push(key, value);
                         }
-                        builder.push_all_except(&accessor, None);
+                        if source_algo.is_active() {
+                            for (key, value) in &decompressed_page_entries {
+                                builder.push(key, value);
+                            }
+                        } else {
+                            builder.push_all_except(&accessor, None);
+                        }
                     }
                     SubtreeEdge::Right => {
-                        builder.push_all_except(&accessor, None);
+                        if source_algo.is_active() {
+                            for (key, value) in &decompressed_page_entries {
+                                builder.push(key, value);
+                            }
+                        } else {
+                            builder.push_all_except(&accessor, None);
+                        }
                         for (key, value) in &entries {
                             builder.push(key, value);
                         }
@@ -1136,6 +1168,7 @@ impl SubtreeBuilder {
         root_distance: u32,
         removed_indexes: &[usize],
     ) -> Result<()> {
+        let source_algo = accessor.compression_algorithm();
         match self.direction {
             BuildDirection::LeftToRight => {
                 let mut removed_pos = 0;
@@ -1147,7 +1180,12 @@ impl SubtreeBuilder {
                         removed_pos += 1;
                     } else {
                         let entry = accessor.entry(i).unwrap();
-                        self.push_leaf_entry(context, entry.key(), entry.value(), root_distance)?;
+                        if source_algo.is_active() {
+                            let decompressed = source_algo.decompress(entry.value());
+                            self.push_leaf_entry(context, entry.key(), &decompressed, root_distance)?;
+                        } else {
+                            self.push_leaf_entry(context, entry.key(), entry.value(), root_distance)?;
+                        }
                     }
                 }
                 assert_eq!(removed_pos, removed_indexes.len());
@@ -1163,7 +1201,12 @@ impl SubtreeBuilder {
                         removed_pos -= 1;
                     } else {
                         let entry = accessor.entry(i).unwrap();
-                        self.push_leaf_entry(context, entry.key(), entry.value(), root_distance)?;
+                        if source_algo.is_active() {
+                            let decompressed = source_algo.decompress(entry.value());
+                            self.push_leaf_entry(context, entry.key(), &decompressed, root_distance)?;
+                        } else {
+                            self.push_leaf_entry(context, entry.key(), entry.value(), root_distance)?;
+                        }
                     }
                 }
                 assert_eq!(removed_pos, 0);

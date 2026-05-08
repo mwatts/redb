@@ -11,8 +11,8 @@
 #[cfg(feature = "compression")]
 mod compression {
     use redb::{
-        CompressionAlgorithm, Database, ReadableDatabase, ReadableTable, TableDefinition,
-        WriteTransaction,
+        CompressionAlgorithm, Database, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+        TableDefinition, WriteTransaction,
     };
     use std::fs;
     use std::time::Instant;
@@ -334,6 +334,117 @@ mod compression {
 
         // No hard assertion on timing (CI varies), but print ratios for inspection.
         // Compressed reads are expected to be slower due to decompression overhead.
+    }
+
+    // ── retain / extract_if on compressed tables ──────────────────────────────────
+
+    #[test]
+    fn retain_on_compressed_table() {
+        let file = NamedTempFile::new().unwrap();
+        let blob_a = json_blob(16 * 1024);
+        let blob_b = json_blob(32 * 1024);
+        let blob_c = json_blob(24 * 1024);
+
+        let db = Database::builder().create(file.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table_with_compression(TABLE, CompressionAlgorithm::Lz4).unwrap();
+            table.insert(&1u64, blob_a.as_slice()).unwrap();
+            table.insert(&2u64, blob_b.as_slice()).unwrap();
+            table.insert(&3u64, blob_c.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table_with_compression(TABLE, CompressionAlgorithm::Lz4).unwrap();
+            table.retain(|k, v| {
+                assert!(v[0] == b'{', "predicate received compressed bytes");
+                k % 2 == 0
+            }).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let table = rtxn.open_table(TABLE).unwrap();
+        assert!(table.get(&1u64).unwrap().is_none());
+        let val2 = table.get(&2u64).unwrap().expect("key 2 must survive");
+        assert_eq!(val2.value(), blob_b.as_slice());
+        assert!(table.get(&3u64).unwrap().is_none());
+        assert_eq!(table.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn retain_preserves_all_on_compressed_table() {
+        let file = NamedTempFile::new().unwrap();
+        let blob = json_blob(16 * 1024);
+
+        let db = Database::builder().create(file.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table_with_compression(TABLE, CompressionAlgorithm::Lz4).unwrap();
+            for i in 0..5u64 {
+                table.insert(&i, blob.as_slice()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table_with_compression(TABLE, CompressionAlgorithm::Lz4).unwrap();
+            table.retain(|_k, v| {
+                assert!(v[0] == b'{');
+                true
+            }).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let table = rtxn.open_table(TABLE).unwrap();
+        assert_eq!(table.len().unwrap(), 5);
+        for i in 0..5u64 {
+            let guard = table.get(&i).unwrap().expect("all keys must survive");
+            assert_eq!(guard.value(), blob.as_slice());
+        }
+    }
+
+    #[test]
+    fn extract_if_on_compressed_table() {
+        let file = NamedTempFile::new().unwrap();
+        let blob_a = json_blob(16 * 1024);
+        let blob_b = json_blob(32 * 1024);
+
+        let db = Database::builder().create(file.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table_with_compression(TABLE, CompressionAlgorithm::Lz4).unwrap();
+            table.insert(&10u64, blob_a.as_slice()).unwrap();
+            table.insert(&20u64, blob_b.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table_with_compression(TABLE, CompressionAlgorithm::Lz4).unwrap();
+            let extracted: Vec<_> = table
+                .extract_if(|k, v| {
+                    assert!(v[0] == b'{', "predicate received compressed bytes");
+                    k == 10
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(extracted.len(), 1);
+            assert_eq!(extracted[0].0.value(), 10u64);
+            assert_eq!(extracted[0].1.value(), blob_a.as_slice());
+        }
+        txn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let table = rtxn.open_table(TABLE).unwrap();
+        assert!(table.get(&10u64).unwrap().is_none());
+        let val = table.get(&20u64).unwrap().expect("key 20 must survive");
+        assert_eq!(val.value(), blob_b.as_slice());
     }
 
     // ── backward compatibility ────────────────────────────────────────────────────

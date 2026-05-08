@@ -805,6 +805,7 @@ impl Drop for TableTreeMut {
 
 #[cfg(test)]
 mod test {
+    use crate::CompressionAlgorithm;
     use crate::Value;
     use crate::tree_store::table_tree_base::InternalTableDefinition;
     use crate::types::TypeName;

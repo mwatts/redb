@@ -1,5 +1,7 @@
 use crate::Result;
+use crate::compression::CompressionAlgorithm;
 use crate::tree_store::btree_iters::{BtreeRangeIter, RangeLeafEntry, RangeVisit};
+use crate::tree_store::page_store::Page;
 use crate::tree_store::subtree_rebuild::{
     InProgressSubtree, LeafRewrite, SealedSubtree, SubtreeBuilder, SubtreeRebuildContext,
     finish_rebuilt_root,
@@ -132,7 +134,14 @@ impl Retain {
         let entry_accessor = entry.entry::<K, V>();
         let key = entry_accessor.key();
 
-        if !predicate(K::from_bytes(key), V::from_bytes(entry_accessor.value())) {
+        let page_algo = CompressionAlgorithm::from_flag_byte(entry.page().memory()[1]);
+        let keep = if page_algo.is_active() {
+            let decompressed = page_algo.decompress(entry_accessor.value());
+            predicate(K::from_bytes(key), V::from_bytes(&decompressed))
+        } else {
+            predicate(K::from_bytes(key), V::from_bytes(entry_accessor.value()))
+        };
+        if !keep {
             self.mark_removed::<K, V>(context, entry.entry_index())?;
         }
         Ok(())

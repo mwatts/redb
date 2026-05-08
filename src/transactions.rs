@@ -700,7 +700,7 @@ impl TableNamespace {
         let (root, _) = self.inner_open::<K, V>(definition.name(), TableType::Normal, compression)?;
         self.set_dirty(transaction);
 
-        Ok(Table::new_with_compression(
+        Ok(Table::new(
             definition.name(),
             root,
             self.freed_pages.clone(),

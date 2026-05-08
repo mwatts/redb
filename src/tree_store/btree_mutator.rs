@@ -179,6 +179,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             &self.allocated,
             self.freed,
             self.modify_uncommitted,
+            self.compression,
         );
         let mut retain = Retain::new();
         retain.execute(

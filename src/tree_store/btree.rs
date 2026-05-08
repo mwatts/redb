@@ -851,7 +851,6 @@ pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
     cached_root: Option<PageImpl>,
     root: Option<BtreeHeader>,
     hint: PageHint,
-    compression: CompressionAlgorithm,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
@@ -874,15 +873,9 @@ impl<K: Key, V: Value> Btree<K, V> {
             cached_root,
             root,
             hint,
-            compression: CompressionAlgorithm::None,
             _key_type: PhantomData,
             _value_type: PhantomData,
         })
-    }
-
-    pub(crate) fn with_compression(mut self, compression: CompressionAlgorithm) -> Self {
-        self.compression = compression;
-        self
     }
 
     pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
